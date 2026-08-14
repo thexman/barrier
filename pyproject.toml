@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barrier-alpr"
+version = "0.1.0"
+description = "Automatic license plate recognition built on top of fast-alpr."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+license = { text = "MIT" }
+authors = [{ name = "Barrier ALPR" }]
+dependencies = [
+    "fast-alpr[onnx]>=0.4.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+barrier-alpr = "barrier_alpr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"barrier_alpr" = ["py.typed"]
