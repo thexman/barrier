@@ -1,0 +1,7 @@
+# Core ALPR engine (ONNX Runtime CPU build).
+# For NVIDIA GPU use fast-alpr[onnx-gpu], for Windows DirectML use fast-alpr[onnx-directml].
+fast-alpr[onnx]>=0.4.0
+
+# Image I/O and drawing.
+opencv-python>=4.9.0
+numpy>=1.26.0

@@ -1,0 +1,7 @@
+# Example plates allowlist for `java -jar barrier.jar orchestrator`.
+# One plate per line. Comments start with '#'. Blank lines are ignored.
+# Matching is case-insensitive and ignores non-alphanumeric characters,
+# so "AB 12-34" here would match OCR results like "ab1234" or "AB-1234".
+
+CO4701BC
+CA1234AB

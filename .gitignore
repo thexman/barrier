@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Java / Maven
+java/barrier/target/
+*.iml
+*.class
+
+# ALPR model cache (downloaded at runtime)
+.cache/
+*.onnx
+
+# Output artefacts (camera / orchestrator captures)
+photos/
+photos-test/
+outputs/
+*.log

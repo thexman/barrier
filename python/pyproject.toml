@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barrier"
+version = "0.1.0"
+description = "Barrier: ALPR Python module and HTTP sidecar for the Java parking-gate orchestrator. Proximity, servo, camera and orchestration run in the Java fat JAR — see ../java/README.md."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Barrier ALPR" }]
+dependencies = [
+    "fast-alpr[onnx]>=0.4.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+sidecar = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+barrier-recognizer = "recognizer_alpr.cli:main"
+barrier-recognizer-service = "recognizer_alpr.service:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"recognizer_alpr" = ["py.typed"]

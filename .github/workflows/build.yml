@@ -1,0 +1,447 @@
+# Build Java fat JAR + offline Python ALPR Pi bundle, upload artifacts,
+# and always publish / update a GitHub Release:
+#   - tagged build  → release name / tag = the git tag (e.g. v0.1.0)
+#   - untagged build → release name / tag = "snapshot" (tag moved + assets
+#     replaced in place; create once in the GitHub UI if missing — GITHUB_TOKEN
+#     cannot create-a-release when the commit changes .github/workflows/)
+#
+# Artifacts (Actions → run → Artifacts):
+#   barrier-jar                 → barrier.jar
+#   barrier-python-pi-aarch64   → barrier-python-pi-aarch64.tar.gz
+#
+# From a release on the Pi:
+#   VERSION=v0.1.0   # or VERSION=snapshot
+#   curl -fsSL -o barrier.jar \
+#     "https://github.com/thexman/barrier/releases/download/${VERSION}/barrier.jar"
+#   curl -fsSL -o barrier-python-pi-aarch64.tar.gz \
+#     "https://github.com/thexman/barrier/releases/download/${VERSION}/barrier-python-pi-aarch64.tar.gz"
+
+name: Build
+
+on:
+  push:
+    branches: [main, release]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, release]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Wheel tags are ABI-specific (numpy, onnxruntime, …). Build for the Python
+  # versions commonly shipped on Raspberry Pi OS (Bookworm=3.11, Trixie=3.13).
+  PYTHON_VERSIONS: "3.11 3.13"
+  BUNDLE_NAME: barrier-python-pi-aarch64
+
+jobs:
+  java:
+    name: Java (fat JAR)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: java/barrier
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Embed git commit into build-info.properties
+        working-directory: java/barrier
+        run: |
+          set -euo pipefail
+          mkdir -p src/main/resources
+          {
+            echo "git.commit=${GITHUB_SHA}"
+            echo "git.ref=${GITHUB_REF_NAME}"
+            echo "built.at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > src/main/resources/build-info.properties
+          echo "Embedded build-info.properties:"
+          cat src/main/resources/build-info.properties
+
+      - name: Build, test, and package fat JAR
+        run: mvn -B clean verify
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          VERSION="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
+          mkdir -p dist
+          cp target/barrier.jar "dist/barrier.jar"
+          cp target/barrier.jar "dist/barrier-${VERSION}.jar"
+          {
+            echo "artifact=barrier.jar"
+            echo "version=${VERSION}"
+            echo "git_sha=${GITHUB_SHA}"
+            echo "git_ref=${GITHUB_REF}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "java_target=17"
+            echo "runner_os=${RUNNER_OS}"
+          } > dist/BUILD.txt
+          ls -lh dist/
+          jar tf dist/barrier.jar | head -n 5
+          echo "--- version command ---"
+          java -jar dist/barrier.jar version
+          java -jar dist/barrier.jar version | grep -qx "${GITHUB_SHA}"
+
+      - name: Upload barrier JAR artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: barrier-jar
+          path: java/barrier/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  python:
+    name: Python (Pi aarch64 bundle)
+    # Native aarch64 runner so onnxruntime / opencv / numpy wheels match the Pi.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build wheelhouse (package + all deps, per Python ABI)
+        working-directory: python
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist-python/wheelhouse
+          for ver in ${PYTHON_VERSIONS}; do
+            echo "::group::Wheels for Python ${ver}"
+            py="python${ver}"
+            "$py" -m pip install --upgrade pip wheel build
+            # Include pip itself so install.sh can stay fully offline.
+            "$py" -m pip wheel -w ../dist-python/wheelhouse pip wheel
+            "$py" -m pip wheel -w ../dist-python/wheelhouse ".[sidecar]"
+            echo "::endgroup::"
+          done
+          ls -lh ../dist-python/wheelhouse | head -n 80
+          echo "wheel count=$(find ../dist-python/wheelhouse -name '*.whl' | wc -l)"
+          # Sanity: numpy must exist for each ABI we claim to support.
+          for ver in ${PYTHON_VERSIONS}; do
+            tag="cp${ver//./}"
+            if ! find ../dist-python/wheelhouse -name "numpy-*-${tag}-*.whl" | grep -q .; then
+              echo "error: missing numpy wheel for ${tag}" >&2
+              find ../dist-python/wheelhouse -name 'numpy-*.whl' >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Install from wheelhouse and download ONNX models
+        run: |
+          set -euo pipefail
+          # Verify offline install for every bundled ABI; warm models once.
+          WARM_VER=""
+          for ver in ${PYTHON_VERSIONS}; do
+            echo "::group::Offline install check Python ${ver}"
+            venv="/tmp/barrier-warm-${ver}"
+            "python${ver}" -m venv "$venv"
+            # shellcheck disable=SC1091
+            source "${venv}/bin/activate"
+            python -m pip install --no-index --find-links=dist-python/wheelhouse --upgrade pip
+            python -m pip install --no-index --find-links=dist-python/wheelhouse "barrier[sidecar]"
+            deactivate
+            echo "::endgroup::"
+            WARM_VER="$ver"
+          done
+
+          # shellcheck disable=SC1091
+          source "/tmp/barrier-warm-${WARM_VER}/bin/activate"
+          python - <<'PY'
+          from pathlib import Path
+
+          import cv2
+          import numpy as np
+          from recognizer_alpr import PlateRecognizer
+
+          recognizer = PlateRecognizer()
+          frame = np.zeros((480, 640, 3), dtype=np.uint8)
+          cv2.putText(
+              frame, "ABC123", (180, 260),
+              cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3, cv2.LINE_AA,
+          )
+          result = recognizer.recognize(frame)
+          print("warmup plates=", [p.text for p in result.plates])
+
+          home_cache = Path.home() / ".cache"
+          required = ["open-image-models", "fast-plate-ocr"]
+          for name in required:
+              path = home_cache / name
+              files = [p for p in path.rglob("*") if p.is_file()] if path.exists() else []
+              print(f"{path}: files={len(files)} bytes={sum(p.stat().st_size for p in files)}")
+              if not files:
+                  raise SystemExit(f"model cache empty: {path}")
+          PY
+
+          mkdir -p dist-python/models
+          cp -a "$HOME/.cache/open-image-models" dist-python/models/open-image-models
+          cp -a "$HOME/.cache/fast-plate-ocr" dist-python/models/fast-plate-ocr
+          find dist-python/models -type f | head -n 40
+          du -sh dist-python/models/*
+
+      - name: Stage bundle
+        run: |
+          set -euo pipefail
+          STAGE="dist-python/${BUNDLE_NAME}"
+          mkdir -p "$STAGE"
+          cp -a dist-python/wheelhouse "$STAGE/wheelhouse"
+          cp -a dist-python/models "$STAGE/models"
+          cp python/packaging/pi-install.sh "$STAGE/install.sh"
+          cp python/packaging/pi-run-sidecar.sh "$STAGE/run-sidecar.sh"
+          chmod +x "$STAGE/install.sh" "$STAGE/run-sidecar.sh"
+
+          VERSION="$(python3.13 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project']['version'])")"
+          {
+            echo "artifact=${BUNDLE_NAME}.tar.gz"
+            echo "version=${VERSION}"
+            echo "python_versions=${PYTHON_VERSIONS}"
+            echo "platform=linux_aarch64"
+            echo "git_sha=${GITHUB_SHA}"
+            echo "git_ref=${GITHUB_REF}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "models=open-image-models (yolo-v9-t-384) + fast-plate-ocr (cct-xs-v2-global)"
+            echo "extras=sidecar (fastapi/uvicorn)"
+          } > "$STAGE/BUILD.txt"
+
+          cat > "$STAGE/README.txt" <<EOF
+          Barrier Python ALPR bundle for Raspberry Pi (aarch64)
+          =====================================================
+
+          Contents
+            wheelhouse/   pip wheels for barrier + all dependencies
+            models/       ONNX detector + OCR caches (copied to ~/.cache by install.sh)
+            install.sh    create a local venv and install offline
+            run-sidecar.sh  start barrier-recognizer-service
+
+          Requires system Python matching one of: ${PYTHON_VERSIONS}
+          (Raspberry Pi OS Bookworm → 3.11, Trixie → 3.13)
+
+          On the Pi (64-bit):
+            sudo apt install -y python3 python3-venv
+            tar xzf ${BUNDLE_NAME}.tar.gz
+            cd ${BUNDLE_NAME}
+            ./install.sh
+            ./run-sidecar.sh --host 127.0.0.1 --port 8765
+
+          Then point the Java orchestrator at http://127.0.0.1:8765
+          EOF
+          sed -i 's/^          //' "$STAGE/README.txt"
+
+          tar -C dist-python -czf "dist-python/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
+          ls -lh "dist-python/${BUNDLE_NAME}.tar.gz"
+          du -sh "$STAGE" "$STAGE/wheelhouse" "$STAGE/models"
+
+          mkdir -p dist-python/upload
+          cp "dist-python/${BUNDLE_NAME}.tar.gz" dist-python/upload/
+          cp "$STAGE/BUILD.txt" "dist-python/upload/${BUNDLE_NAME}-BUILD.txt"
+          cp "$STAGE/README.txt" "dist-python/upload/${BUNDLE_NAME}-README.txt"
+
+      - name: Upload Pi Python artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: barrier-python-pi-aarch64
+          path: dist-python/upload/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    needs: [java, python]
+    # Always publish a release for pushes / tags / manual runs (not PRs).
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Serialize snapshot publishes so concurrent branch builds don't race.
+    concurrency:
+      group: barrier-github-release-${{ github.ref_type == 'tag' && github.ref_name || 'snapshot' }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Download Java artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: barrier-jar
+          path: dist/java
+
+      - name: Download Python artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: barrier-python-pi-aarch64
+          path: dist/python
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          cp dist/java/barrier.jar dist/release/barrier.jar
+          cp dist/java/BUILD.txt dist/release/barrier-jar-BUILD.txt
+          cp dist/python/barrier-python-pi-aarch64.tar.gz dist/release/
+          cp dist/python/barrier-python-pi-aarch64-BUILD.txt dist/release/
+          cp dist/python/barrier-python-pi-aarch64-README.txt dist/release/
+          ls -lh dist/release/
+
+      - name: Resolve release name
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            NAME="${GITHUB_REF_NAME}"
+            echo "is_snapshot=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+            echo "body=" >> "$GITHUB_OUTPUT"
+          else
+            NAME="snapshot"
+            echo "is_snapshot=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<EOF"
+              echo "Rolling snapshot from \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`)."
+              echo "Assets are replaced on every push to \`main\` / \`release\`."
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release name/tag: ${NAME}"
+
+      # GITHUB_TOKEN cannot create/move tags or releases onto a commit that
+      # *changes* .github/workflows/ (403). workflow_dispatch of a later commit
+      # often works because only asset upload is needed. Strategy:
+      #   - if release exists → always replace assets (and notes)
+      #   - move snapshot tag only when this commit does not touch workflows
+      #   - never fail the job solely because the tag move was denied
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          IS_SNAPSHOT: ${{ steps.meta.outputs.is_snapshot }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          LATEST: ${{ steps.meta.outputs.latest }}
+          BODY: ${{ steps.meta.outputs.body }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          SHA="${GITHUB_SHA}"
+          ASSETS=(
+            dist/release/barrier.jar
+            dist/release/barrier-jar-BUILD.txt
+            dist/release/barrier-python-pi-aarch64.tar.gz
+            dist/release/barrier-python-pi-aarch64-BUILD.txt
+            dist/release/barrier-python-pi-aarch64-README.txt
+          )
+
+          commit_touches_workflows() {
+            gh api "repos/${REPO}/commits/${SHA}" --jq '
+              [.files[].filename]
+              | map(select(startswith(".github/workflows/")))
+              | length > 0
+            '
+          }
+
+          point_tag() {
+            if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+              gh api --method PATCH "repos/${REPO}/git/refs/tags/${TAG}" \
+                -f sha="${SHA}" -F force=true >/dev/null
+            else
+              gh api --method POST "repos/${REPO}/git/refs" \
+                -f ref="refs/tags/${TAG}" -f sha="${SHA}" >/dev/null
+            fi
+            echo "Tag ${TAG} → ${SHA}"
+          }
+
+          create_release() {
+            args=(release create "${TAG}" --repo "${REPO}" --title "${TAG}" --target "${SHA}")
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            if [[ -n "${BODY}" ]]; then
+              args+=(--notes "${BODY}")
+            else
+              args+=(--generate-notes)
+            fi
+            gh "${args[@]}" "${ASSETS[@]}"
+          }
+
+          upload_assets() {
+            gh release upload "${TAG}" --repo "${REPO}" --clobber "${ASSETS[@]}"
+          }
+
+          edit_release() {
+            args=(release edit "${TAG}" --repo "${REPO}" --title "${TAG}")
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              args+=(--prerelease)
+            else
+              args+=(--prerelease=false)
+            fi
+            if [[ "${LATEST}" == "true" ]]; then
+              args+=(--latest)
+            fi
+            if [[ -n "${BODY}" ]]; then
+              args+=(--notes "${BODY}")
+            fi
+            gh "${args[@]}"
+          }
+
+          TOUCHES_WORKFLOWS="$(commit_touches_workflows)"
+          echo "Commit touches .github/workflows/: ${TOUCHES_WORKFLOWS}"
+
+          if [[ "${IS_SNAPSHOT}" == "true" ]]; then
+            if [[ "${TOUCHES_WORKFLOWS}" == "true" ]]; then
+              echo "Skipping tag move: GITHUB_TOKEN cannot retarget tags to commits that change workflow files."
+            else
+              # Tag move is best-effort; asset upload below is what matters for consumers.
+              if ! point_tag; then
+                echo "warning: could not move tag ${TAG} → ${SHA} (continuing with asset upload)" >&2
+              fi
+            fi
+          fi
+
+          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            echo "Updating existing release ${TAG}…"
+            upload_assets
+            edit_release
+          else
+            if [[ "${TOUCHES_WORKFLOWS}" == "true" ]]; then
+              cat <<EOF
+          error: release '${TAG}' does not exist, and this commit changes .github/workflows/,
+          so GITHUB_TOKEN cannot create it (HTTP 403).
+
+          One-time fix (no PAT): create the release in the UI, then re-run:
+            https://github.com/${REPO}/releases/new?tag=${TAG}&prerelease=$([[ "${PRERELEASE}" == "true" ]] && echo 1 || echo 0)
+
+          After that, pushes only replace assets (and move the tag when the commit
+          does not touch workflow files).
+          EOF
+              exit 1
+            fi
+            echo "Creating release ${TAG}…"
+            create_release
+          fi
+
+          echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
