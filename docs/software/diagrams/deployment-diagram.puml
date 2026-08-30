@@ -1,0 +1,78 @@
+@startuml barrier_deployment
+title Barrier - Deployment diagram (Raspberry Pi)
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+node "Raspberry Pi (64-bit OS)" as Pi {
+
+  file "plates.txt\n(allowlist)" as Allow
+  node "JVM 17+" as Jvm {
+    artifact "barrier.jar\n(Java fat JAR)" as Jar
+    note right of Jar
+      States: IDLE -> CAPTURING ->
+      RECOGNIZING -> AUTHORIZING ->
+      OPENING -> OPEN_HOLD ->
+      CLOSING -> COOLDOWN
+    end note
+    component "Orchestrator" as Orch
+    component "Proximity\n(diozero -> pigpio)" as Prox
+    component "ServoGate\n(diozero -> pigpio)" as Servo
+    component "RpiCamera" as Cam
+    component "RecognizerClient\n(HTTP/1.1)" as Client
+  }
+  Allow -[hidden]right-> Jvm
+
+  node "Python venv\n(barrier-python-pi-aarch64)" as PyVenv {
+    artifact "barrier-recognizer-service\n(FastAPI + uvicorn)" as Side
+    note right of Side
+      Long-lived sidecar.
+      Java posts local file paths;
+      no image bytes over HTTP.
+    end note
+    component "PlateRecognizer\n(fast-alpr ONNX)" as Alpr
+    folder "~/.cache\nopen-image-models\nfast-plate-ocr" as Models
+  }
+
+  artifact "rpicam-still\n(rpicam-apps)" as Rpicam
+  artifact "pigpiod\n(systemd)" as Pigpiod
+
+  folder "./photos/cycle_NNNN/\n*.jpg" as Photos
+}
+
+node "Hardware" as Hw {
+  node "HC-SR04\nultrasonic" as Hcsr
+  node "Hobby servo\n(gate)" as ServoHw
+  node "CSI camera\n(ribbon)" as CamHw
+}
+
+Jar .up.> Orch
+Jar .up.> Prox
+Jar .up.> Servo
+Jar .up.> Cam
+Jar .up.> Client
+
+Orch --> Prox
+Orch --> Servo
+Orch --> Cam
+Orch --> Client
+Orch ..> Allow : read
+Orch ..> Photos : write paths
+
+Prox --> Pigpiod : socket\nPIGPIOD_HOST=127.0.0.1
+Servo --> Pigpiod
+Pigpiod --> Hcsr : GPIO
+Pigpiod --> ServoHw : PWM GPIO
+
+Cam --> Rpicam : Starts process
+Rpicam --> CamHw
+Rpicam --> Photos : write JPG
+
+Client --> Side : POST /recognize/path\nhttp://127.0.0.1:8765
+Side --> Alpr
+Alpr --> Models : ONNX
+Side ..> Photos : read image by path
+
+
+
+@enduml

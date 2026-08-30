@@ -1,0 +1,216 @@
+@startuml BarrierOrchestrator
+
+title Smart Parking Barrier — Activity Diagram
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundcorner 14
+
+skinparam activity {
+    BackgroundColor #F7F9FC
+    BorderColor #475569
+    FontColor #1E293B
+
+    StartColor #16A34A
+    EndColor #DC2626
+
+    DiamondBackgroundColor #FFF7ED
+    DiamondBorderColor #F97316
+    DiamondFontColor #7C2D12
+
+    BarColor #64748B
+}
+
+skinparam partition {
+    BorderColor #CBD5E1
+    FontColor #334155
+}
+
+' ============================================================
+' JAVA ORCHESTRATOR
+' ============================================================
+
+|Java Orchestrator|
+
+start
+
+:Initialize orchestrator;
+:State = **IDLE**;
+
+while (Continue processing?) is (yes)
+
+    :Wait for vehicle;
+
+    note right
+      HC-SR04 sensor
+      Debounced NEAR detection
+    end note
+
+    if (Stop requested?) then (yes)
+        break
+    endif
+
+    if (Allowlist changed?) then (yes)
+        :Reload allowed plates;
+    endif
+
+    ' --------------------------------------------------------
+    ' CAPTURE
+    ' --------------------------------------------------------
+
+    :State = **CAPTURING**;
+    :Create cycle photo directory\nphotos/cycle_NNNN/;
+
+    |Camera — rpicam-still|
+
+    :Capture image frames;
+    :Save JPG files to disk;
+
+    |Java Orchestrator|
+
+    if (Capture successful?) then (no)
+
+        :State = **COOLDOWN**\nCapture failure; <<#FFE4E6>>
+        :Wait cooldown period;
+
+    else (yes)
+
+        ' ----------------------------------------------------
+        ' RECOGNITION
+        ' ----------------------------------------------------
+
+        :State = **RECOGNIZING**;
+
+        while (More frames?) is (yes)
+
+            :Send image path\nPOST /recognize/path;
+
+            |Python ALPR Service|
+
+            :Receive JSON image path;
+
+            if (Image exists?) then (no)
+
+                :Return **HTTP 404**; <<#FFE4E6>>
+
+            else (yes)
+
+                :Run PlateRecognizer.recognize(path)\nFastALPR / ONNX;
+
+                :Detect license plate\nand perform OCR;
+
+                :Return recognition result\nplate text + confidence + bbox;
+
+            endif
+
+            |Java Orchestrator|
+
+            :Store recognition result;
+
+        endwhile (no)
+
+        :Select plate with\nhighest OCR confidence;
+
+        if (Valid plate found?) then (no)
+
+            :State = **COOLDOWN**\nNo plate recognized; <<#FFE4E6>>
+            :Wait cooldown period;
+
+        else (yes)
+
+            ' ------------------------------------------------
+            ' AUTHORIZATION
+            ' ------------------------------------------------
+
+            :State = **AUTHORIZING**;
+
+            if (Plate allowlisted?) then (no)
+
+                :Access **DENIED**; <<#FFE4E6>>
+                :State = **COOLDOWN**; <<#FFE4E6>>
+                :Wait cooldown period;
+
+            else (yes)
+
+                :Access **GRANTED**; <<#DCFCE7>>
+
+                ' --------------------------------------------
+                ' OPEN BARRIER
+                ' --------------------------------------------
+
+                :State = **OPENING**;
+
+                if (Dry-run mode?) then (yes)
+
+                    :Skip physical servo action;
+
+                else (no)
+
+                    :Open barrier servo\nvia pigpiod;
+
+                endif
+
+                ' --------------------------------------------
+                ' HOLD OPEN
+                ' --------------------------------------------
+
+                :State = **OPEN HOLD**;
+
+                :Keep barrier open;
+
+                note right
+                  Hold time may be extended
+                  while HC-SR04 continues
+                  detecting the vehicle as NEAR.
+                end note
+
+                ' --------------------------------------------
+                ' CLOSE BARRIER
+                ' --------------------------------------------
+
+                :State = **CLOSING**;
+
+                if (Dry-run mode?) then (yes)
+
+                    :Skip physical servo action;
+
+                else (no)
+
+                    :Close barrier servo\nvia pigpiod;
+
+                endif
+
+                ' --------------------------------------------
+                ' SUCCESSFUL CYCLE
+                ' --------------------------------------------
+
+                :State = **COOLDOWN**\nCycle complete; <<#E0F2FE>>
+                :Wait cooldown period;
+
+            endif
+        endif
+    endif
+
+    ' --------------------------------------------------------
+    ' NEXT CYCLE
+    ' --------------------------------------------------------
+
+    :cyclesCompleted++;
+
+endwhile (no)
+
+' ============================================================
+' SHUTDOWN
+' ============================================================
+
+|Java Orchestrator|
+
+:State = **STOPPING**;
+
+:Best-effort barrier close;
+
+:Release hardware resources\nHC-SR04 + Camera + Servo;
+
+stop
+
+@enduml
